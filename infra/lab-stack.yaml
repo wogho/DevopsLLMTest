@@ -1,0 +1,494 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DevOps LLM Agent Lab - 실습 인프라 전체.
+
+  만드는 것:
+    · 전용 VPC (퍼블릭 서브넷 2개)
+    · EKS Auto Mode 클러스터  (노드그룹 관리 불필요)
+    · 부트스트랩용 CodeBuild 프로젝트
+        → ArgoCD 설치 + Git 서버 설치 + 앱 매니페스트 시드 + ArgoCD Application 생성
+    · 진단 알림용 SNS 토픽
+
+  배포:  python deploy_lab.py
+    1) 이 스택 생성        약 12~15분  (EKS 컨트롤플레인이 대부분)
+    2) CodeBuild 부트스트랩 약 5~10분  (Gitea 기준)
+
+  스택만으로는 클러스터가 비어 있습니다. 부트스트랩까지 끝나야 앱이 뜹니다.
+
+Parameters:
+  StudentName:
+    Type: String
+    AllowedPattern: '[a-z0-9-]{2,20}'
+    Description: 소문자/숫자/하이픈 2~20자. 리소스 이름과 리포트에 쓰입니다.
+
+  CallerArn:
+    Type: String
+    Description: >
+      이 스택을 배포하는 IAM 사용자 ARN. 클러스터 접근 권한을 주는 데 씁니다.
+      deploy_lab.py 가 자동으로 채웁니다.
+
+  ExtraAdminArn:
+    Type: String
+    Default: ''
+    Description: >
+      클러스터에 추가로 접근시킬 IAM 주체 ARN (콘솔 로그인 역할 등).
+      비워두면 스택을 만든 사용자만 접근할 수 있습니다.
+      나중에 추가하려면 python grant_access.py 를 쓰세요.
+
+  GitProvider:
+    Type: String
+    Default: gitea
+    AllowedValues: [gitea, gitlab]
+    Description: >
+      클러스터에 올릴 Git 서버.
+      gitea  = 1분이면 뜹니다. 리허설과 강의는 이걸 권장합니다.
+      gitlab = 진짜 GitLab CE. 메모리를 많이 쓰고 안정화에 20~30분 걸립니다.
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: 진단 리포트를 받을 이메일. 비우면 SNS 구독을 만들지 않습니다.
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.33'
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  HasExtraAdmin: !Not [!Equals [!Ref ExtraAdminArn, '']]
+
+Mappings:
+  Cidr:
+    Vpc:
+      Block: 10.42.0.0/16
+    SubnetA:
+      Block: 10.42.1.0/24
+    SubnetB:
+      Block: 10.42.2.0/24
+
+Resources:
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 네트워크
+  # ═══════════════════════════════════════════════════════════════════
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [Cidr, Vpc, Block]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [Cidr, SubnetA, Block]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-subnet-a'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [Cidr, SubnetB, Block]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-subnet-b'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  AssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTable
+
+  AssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref RouteTable
+
+  # ═══════════════════════════════════════════════════════════════════
+  # EKS Auto Mode
+  # ═══════════════════════════════════════════════════════════════════
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSComputePolicy
+        - arn:aws:iam::aws:policy/AmazonEKSBlockStoragePolicy
+        - arn:aws:iam::aws:policy/AmazonEKSLoadBalancingPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSNetworkingPolicy
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub '${AWS::StackName}'
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API
+        # false 로 둡니다. true 면 EKS 가 스택 생성자에게 access entry 를 자동으로 만들고,
+        # 아래 StudentAccess 와 같은 주체가 되어 409 AlreadyExists 로 충돌합니다.
+        BootstrapClusterCreatorAdminPermissions: false
+      ComputeConfig:
+        Enabled: true
+        NodePools: [general-purpose, system]
+        NodeRoleArn: !GetAtt NodeRole.Arn
+      KubernetesNetworkConfig:
+        ElasticLoadBalancing:
+          Enabled: true
+      StorageConfig:
+        BlockStorage:
+          Enabled: true
+      ResourcesVpcConfig:
+        SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+
+  # 스택을 만든 사용자에게 클러스터 관리자 권한
+  StudentAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !Ref CallerArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  # 콘솔/CloudShell 등 다른 주체에게도 접근 권한 (선택)
+  ExtraAdminAccess:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasExtraAdmin
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !Ref ExtraAdminArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  # 부트스트랩 CodeBuild 에게도 관리자 권한
+  BootstrapAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !GetAtt BootstrapRole.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 알림 (SNS)
+  # ═══════════════════════════════════════════════════════════════════
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alerts'
+      DisplayName: DevOps Agent
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 부트스트랩 (CodeBuild)
+  # ═══════════════════════════════════════════════════════════════════
+  BootstrapRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-bootstrap'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Bootstrap
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - elasticloadbalancing:Describe*
+                Resource: '*'
+
+  BootstrapProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${AWS::StackName}-bootstrap'
+      Description: ArgoCD + Git 서버 + 앱을 클러스터에 설치합니다
+      ServiceRole: !GetAtt BootstrapRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      TimeoutInMinutes: 50
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: CLUSTER_NAME
+            Value: !Ref Cluster
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: GIT_PROVIDER
+            Value: !Ref GitProvider
+          - Name: STUDENT
+            Value: !Ref StudentName
+          - Name: APP_NAMESPACE
+            Value: kdt-dev
+          - Name: APP_NAME
+            Value: kdt-dev-api
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - echo "── 도구 설치 ──"
+                - curl -sSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.33.0/bin/linux/amd64/kubectl
+                - chmod +x /usr/local/bin/kubectl
+                - curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+                - kubectl version --client
+                - helm version --short
+            build:
+              commands:
+                - set -e
+                - echo "── 클러스터 연결 ──"
+                - aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+                - kubectl get nodes || echo "(아직 노드가 없습니다. Auto Mode가 필요할 때 만듭니다)"
+
+                - |
+                  echo "── 기본 StorageClass 생성 ──"
+                  # EKS Auto Mode 는 StorageClass 를 자동으로 만들지 않습니다.
+                  # 이게 없으면 Gitea 의 PVC 가 영원히 Pending 에 걸립니다.
+                  cat <<'EOF' | kubectl apply -f -
+                  apiVersion: storage.k8s.io/v1
+                  kind: StorageClass
+                  metadata:
+                    name: auto-ebs-sc
+                    annotations:
+                      storageclass.kubernetes.io/is-default-class: "true"
+                  provisioner: ebs.csi.eks.amazonaws.com
+                  volumeBindingMode: WaitForFirstConsumer
+                  parameters:
+                    type: gp3
+                    encrypted: "true"
+                  EOF
+                  kubectl get storageclass
+
+                - echo "── ArgoCD 설치 ──"
+                - kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+                - kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.13.2/manifests/install.yaml
+                - echo "ArgoCD 파드가 뜰 때까지 대기 (최대 10분)"
+                - kubectl -n argocd wait --for=condition=available --timeout=600s deployment/argocd-server
+                - kubectl -n argocd wait --for=condition=available --timeout=600s deployment/argocd-repo-server
+                - kubectl -n argocd wait --for=condition=available --timeout=600s deployment/argocd-applicationset-controller
+                - kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=600s
+                - |
+                  echo "동기화 주기를 30초로 (기본 3분은 실습에 너무 깁니다)"
+                  kubectl -n argocd patch configmap argocd-cm --type merge \
+                    -p '{"data":{"timeout.reconciliation":"30s"}}'
+                  kubectl -n argocd rollout restart statefulset/argocd-application-controller
+                  kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
+
+                - |
+                  echo "── ArgoCD 외부 접속 (UI 확인용) ──"
+                  # Auto Mode 의 로드밸런싱은 어노테이션으로 지정해야 동작합니다.
+                  kubectl -n argocd annotate svc argocd-server --overwrite \
+                    service.beta.kubernetes.io/aws-load-balancer-type=external \
+                    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type=ip \
+                    service.beta.kubernetes.io/aws-load-balancer-scheme=internet-facing
+                  kubectl -n argocd patch svc argocd-server -p '{"spec":{"type":"LoadBalancer"}}'
+
+                - echo "── Git 서버 설치 ──"
+                - kubectl create namespace git --dry-run=client -o yaml | kubectl apply -f -
+                - |
+                  if [ "$GIT_PROVIDER" = "gitea" ]; then
+                    helm repo add gitea-charts https://dl.gitea.com/charts/
+                    helm repo update
+                    helm upgrade --install gitea gitea-charts/gitea -n git \
+                      --set gitea.admin.username=labadmin \
+                      --set gitea.admin.password=LabAdmin!2026 \
+                      --set gitea.admin.email=lab@example.com \
+                      --set gitea.config.server.OFFLINE_MODE=true \
+                      --set gitea.config.service.DISABLE_REGISTRATION=true \
+                      --set redis-cluster.enabled=false \
+                      --set postgresql-ha.enabled=false \
+                      --set postgresql.enabled=true \
+                      --set persistence.size=2Gi \
+                      --wait --timeout 15m
+                  else
+                    helm repo add gitlab https://charts.gitlab.io/
+                    helm repo update
+                    helm upgrade --install gitlab gitlab/gitlab -n git \
+                      --set global.hosts.externalIP=0.0.0.0 \
+                      --set global.ingress.configureCertmanager=false \
+                      --set global.ingress.tls.enabled=false \
+                      --set certmanager.install=false \
+                      --set nginx-ingress.enabled=true \
+                      --set prometheus.install=false \
+                      --set gitlab-runner.install=false \
+                      --set registry.enabled=false \
+                      --set gitlab.gitaly.persistence.size=5Gi \
+                      --set postgresql.persistence.size=5Gi \
+                      --timeout 40m --wait
+                  fi
+
+                - |
+                  if [ "$GIT_PROVIDER" = "gitea" ]; then
+                    echo "── Gitea 외부 노출 ──"
+                    # gitea-http 는 headless 서비스(clusterIP: None)라 LoadBalancer 로 바꿀 수 없습니다.
+                    # 같은 셀렉터를 가진 별도 서비스를 만들어 노출합니다.
+                    SEL=$(kubectl -n git get svc gitea-http -o jsonpath='{.spec.selector}')
+                    echo "selector: $SEL"
+                    cat <<EOF | kubectl apply -f -
+                  apiVersion: v1
+                  kind: Service
+                  metadata:
+                    name: gitea-lb
+                    namespace: git
+                    annotations:
+                      service.beta.kubernetes.io/aws-load-balancer-type: external
+                      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+                  spec:
+                    type: LoadBalancer
+                    selector: $SEL
+                    ports:
+                      - name: http
+                        port: 3000
+                        targetPort: 3000
+                  EOF
+                  fi
+
+                - echo "── Git 서버 외부 주소 대기 ──"
+                - |
+                  SVC=$([ "$GIT_PROVIDER" = "gitea" ] && echo "gitea-lb" || echo "gitlab-nginx-ingress-controller")
+                  for i in $(seq 1 60); do
+                    HOST=$(kubectl -n git get svc "$SVC" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+                    [ -n "$HOST" ] && break
+                    echo "  대기 중... ($i/60)"; sleep 10
+                  done
+                  [ -n "$HOST" ] || { echo "Git 서버 LoadBalancer 주소를 얻지 못했습니다"; exit 1; }
+                  echo "GIT_HOST=$HOST"
+                  echo "$HOST" > /tmp/git_host
+
+                - echo "── 부트스트랩 완료 표시 ──"
+                - |
+                  kubectl create namespace "$APP_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+                  kubectl -n "$APP_NAMESPACE" create configmap lab-info \
+                    --from-literal=git_host="$(cat /tmp/git_host)" \
+                    --from-literal=git_provider="$GIT_PROVIDER" \
+                    --from-literal=student="$STUDENT" \
+                    --dry-run=client -o yaml | kubectl apply -f -
+                - echo "부트스트랩이 끝났습니다. 이제 seed_repo.py 가 리포지토리와 앱을 만듭니다."
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+
+Outputs:
+  ClusterName:
+    Description: EKS 클러스터 이름
+    Value: !Ref Cluster
+
+  ClusterEndpoint:
+    Value: !GetAtt Cluster.Endpoint
+
+  BootstrapProjectName:
+    Description: deploy_lab.py 가 실행하는 CodeBuild 프로젝트
+    Value: !Ref BootstrapProject
+
+  AlertTopicArn:
+    Description: 에이전트가 진단 리포트를 보내는 곳
+    Value: !Ref AlertTopic
+
+  AppNamespace:
+    Value: kdt-dev
+
+  AppName:
+    Value: kdt-dev-api
+
+  GitProviderOut:
+    Value: !Ref GitProvider

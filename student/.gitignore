@@ -1,0 +1,6 @@
+.env
+.env.bak
+audit.jsonl
+__pycache__/
+*.pyc
+.venv/
